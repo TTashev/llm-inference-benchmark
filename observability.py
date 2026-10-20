@@ -139,6 +139,8 @@ class RequestObservabilityMiddleware:
         scope.setdefault("state", {})["request_id"] = request_id
         request_id_header = (b"x-request-id", request_id.encode("ascii"))
         path = scope.get("path", "")
+        # Avoid putting arbitrary URL paths (which might contain secrets) in logs.
+        log_path = path if path in ("/generate", "/health", "/ready", "/metrics") else "<other>"
         method = scope.get("method", "")
         start = time.perf_counter()
         response_started = False
@@ -167,7 +169,7 @@ class RequestObservabilityMiddleware:
                 level=logging.ERROR,
                 request_id=request_id,
                 method=method,
-                path=path,
+                path=log_path,
                 error_type=type(exc).__name__,
             )
             if response_started:
@@ -187,7 +189,7 @@ class RequestObservabilityMiddleware:
                     "http_request",
                     request_id=request_id,
                     method=method,
-                    path=path,
+                    path=log_path,
                     status_code=status_code,
                     duration_ms=round(duration_ms, 2),
                 )
