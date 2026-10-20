@@ -143,7 +143,7 @@ Invoke-RestMethod `
     -Body $payload
 ```
 
-Run this in a second PowerShell terminal while Uvicorn is listening on `127.0.0.1:8000`. PowerShell's backtick (`\``) continues the command onto the next line; do not put spaces after it.
+Run this in a second PowerShell terminal while Uvicorn is listening on `127.0.0.1:8000`. The trailing backtick on each continued line must be the last character (no spaces after it).
 
 A successful JSON response includes:
 
