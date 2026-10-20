@@ -128,12 +128,22 @@ curl -X POST http://127.0.0.1:8000/generate \
   -d '{"prompt":"Once upon a time","max_new_tokens":20}'
 ```
 
-Generate text (Windows PowerShell):
+Generate text (Windows PowerShell, using `Invoke-RestMethod`):
 
 ```powershell
-$payload = @{ prompt = "Once upon a time"; max_new_tokens = 20 } | ConvertTo-Json
-Invoke-RestMethod -Uri http://127.0.0.1:8000/generate -Method Post -ContentType "application/json" -Body $payload
+$payload = @{
+    prompt = "Once upon a time"
+    max_new_tokens = 20
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+    -Uri "http://127.0.0.1:8000/generate" `
+    -Method Post `
+    -ContentType "application/json" `
+    -Body $payload
 ```
+
+Run this in a second PowerShell terminal while Uvicorn is listening on `127.0.0.1:8000`. PowerShell's backtick (`\``) continues the command onto the next line; do not put spaces after it.
 
 A successful JSON response includes:
 
