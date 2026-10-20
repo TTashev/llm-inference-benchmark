@@ -51,7 +51,8 @@ The following functionality is available on `main`:
 - Benchmark metrics: request counts, failures, throughput, average latency, p50/p95/p99 client latency, average inference time, lock wait, and residual overhead.
 - Configurable workloads: request count, concurrency levels, repeated runs, warm-up, prompt, token count, endpoint, and CSV destination.
 - CSV summary export and unit tests for benchmark calculations.
-- **Milestone 4 (feature branch):** bounded inference admission, HTTP 503 overload rejection, and benchmark rejection counters. These changes are under review and are not on `main` yet.
+- **Milestone 4 (on `main`):** bounded inference admission, HTTP 503 overload rejection, and rate-controlled benchmarking.
+- **Reliability & observability (feature branch):** JSON request logs, request IDs, liveness/readiness endpoints, in-process metrics, and sanitized HTTP 500 responses.
 
 The benchmark improvements were developed in [PR #2](https://github.com/TTashev/llm-inference-benchmark/pull/2); lock-wait instrumentation was developed in [PR #1](https://github.com/TTashev/llm-inference-benchmark/pull/1).
 
@@ -147,6 +148,51 @@ A successful JSON response includes:
 
 The text and timing shown above are **illustrative**, not guaranteed output.
 
+## Reliability and observability (new feature branch)
+
+On `feature/reliability-observability`, the inference server gains:
+
+- **`GET /health`** — lightweight liveness probe, returns `{"status":"ok"}` even when the model isn't loaded.
+- **`GET /ready`** — readiness probe, returns HTTP 200 after the model pipeline loads; HTTP 503 if the pipeline is unavailable.
+- **`GET /metrics`** — thread-safe, **per-process** JSON counters for generation outcomes (success, intentional 503, client 4xx, unexpected server 5xx), current admitted requests, uptime, and average inference/lock-wait/HTTP times.
+- **`X-Request-ID`** — server-generated correlation ID returned in each HTTP response.
+- **Structured JSON log events** — request method, known route, response status, request ID, elapsed milliseconds, and model lifecycle events. Prompt bodies and generated text are **not logged**; unrecognized URL paths are redacted.
+- **Sanitized HTTP 500 responses** — unexpected errors before a response starts return `{"detail":"Internal server error"}`, with an `X-Request-ID` header. Internal exception text is not exposed to clients; JSON exception logs include only the exception type.
+
+From PowerShell, start a **single-worker** server:
+
+```powershell
+$env:MAX_IN_FLIGHT = "4"
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+Then in another terminal:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+Invoke-RestMethod http://127.0.0.1:8000/ready
+Invoke-RestMethod http://127.0.0.1:8000/metrics
+(Invoke-WebRequest http://127.0.0.1:8000/health).Headers["X-Request-ID"]
+```
+
+A typical **request log event** (example values are illustrative):
+
+```json
+{"timestamp_utc":"2026-10-20T10:00:00+00:00","event":"http_request","request_id":"0123456789abcdef0123456789abcdef","method":"POST","path":"/generate","status_code":200,"duration_ms":42.5}
+```
+
+To avoid per-request logging overhead during throughput benchmarks, set `$env:LOG_REQUESTS = "0"` in the **server** terminal before starting Uvicorn. Metrics, request IDs, startup logs, and exception events remain enabled. Remove the variable (or set it to `1`) to restore access logs.
+
+The `/metrics` fields are cumulative since process startup; they reset when Uvicorn restarts. HTTP outcome counters cover **`/generate` only**, and `avg_generation_http_latency_ms` averages all its HTTP outcomes (including rejected/errors); it is **not** the same as successful-only latency in benchmark CSVs. `generation_in_flight` includes admitted calls waiting for the inference mutex, not all open TCP connections. `inference_completed_total` and its average timings count successful model executions.
+
+**Security/operations limitations:** `/metrics` is unauthenticated, so keep this learning service bound to `127.0.0.1` and protect monitoring endpoints before any external deployment. These are in-memory counters, not persistent time series or Prometheus histograms. Monitoring and admission are per Uvicorn worker, not cluster-wide. A failure after response headers were sent cannot safely be converted to a new 500 response.
+
+Run the complete test suite after checking out this feature branch:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
 ## Running the benchmark
 
 Leave the inference server running and open a second terminal in the repository.
@@ -200,9 +246,9 @@ python -m unittest discover -s tests -v
 
 The CSV contains one summary row per concurrency level and run, with a timestamp, request counts, failures, throughput, average latency, p50/p95/p99, inference time, lock wait, and residual overhead. Four concurrency levels and three runs produce 12 summary rows.
 
-### Overload and backpressure experiment (feature branch)
+### Overload and backpressure experiment
 
-On `feature/bounded-admission-backpressure`, you can control per-process admission capacity through `MAX_IN_FLIGHT` (**default: 4**). It limits all accepted `/generate` requests, **not** the number of parallel model calls. The model lock still permits only one inference call at a time.
+You can control per-process admission capacity through `MAX_IN_FLIGHT` (**default: 4**). It limits all accepted `/generate` requests, **not** the number of parallel model calls. The model lock still permits only one inference call at a time.
 
 Windows PowerShell — set the limit **in the terminal that starts the server**:
 
@@ -272,10 +318,10 @@ This is a basic **constant-rate open-loop load generator** for local learning, n
 | Inference time | Time spent executing the model pipeline after the inference lock is acquired |
 | Lock wait | Time waiting to acquire the shared inference lock |
 | Other overhead | Mean client latency minus mean inference time minus mean lock wait (HTTP, scheduling, and remaining overhead) |
-| Rejected (HTTP 503) | Requests deliberately rejected because inference admission capacity is full (Milestone 4 feature branch) |
+| Rejected (HTTP 503) | Requests deliberately rejected because inference admission capacity is full (Milestone 4) |
 | Rejection rate | Share of all attempted requests receiving HTTP 503 (Milestone 4 feature branch) |
 | Avg rejection latency | Mean end-to-end client time for rejected requests (Milestone 4 feature branch) |
-| Errors | Other failed requests, separate from HTTP 503 overload responses in the Milestone 4 feature branch; failures are excluded from successful-request latency percentiles |
+| Errors | Other failed requests, separate from HTTP 503 overload responses in Milestone 4; failures are excluded from successful-request latency percentiles |
 
 **Note:** More concurrent requests do not necessarily increase throughput when inference is serialized. Percentiles measured over small samples, especially p99, should be interpreted cautiously.
 
@@ -285,9 +331,9 @@ This is a basic **constant-rate open-loop load generator** for local learning, n
 - `torch.set_num_threads(1)` is configured in `main.py` for the current tiny CPU model. This is an experimental configuration, **not a universal recommendation**.
 - Inference is serialized by a mutex; this simplifies behavior but limits concurrency.
 - Benchmarks are local and short. Results depend on CPU resources, OS, VM configuration, background load, and software versions.
-- The `main` branch does not yet include request admission limits; Milestone 4 implements a per-process admission cap in a feature branch.
+- The `main` branch includes bounded admission; metrics and structured logs are under review in the reliability/observability feature branch.
 - The service is not yet production-hardened: it lacks comprehensive authentication, error handling, monitoring, and distributed admission control.
-- `/health` is a basic liveness check, not a comprehensive readiness check.
+- On the reliability/observability branch, `/health` is liveness and `/ready` checks whether the model was loaded; this does not guarantee end-to-end inference success.
 
 ## Example benchmark observations
 
@@ -308,7 +354,8 @@ All 2,000 requests succeeded. Throughput leveled off around 33 req/s while lock-
 2. **CPU model inference** — complete on `main`.
 3. **Benchmarking and metrics** — complete: CLI configuration, p50/p95/p99, CSV export, and unit tests.
 4. **Performance investigations** — CPU threading and mutex contention measured; lock-wait instrumentation is on `main`.
-5. **Overload protection / backpressure** — bounded admission, HTTP 503 handling, and fixed-rate load-generation implemented in `feature/bounded-admission-backpressure` for validation; not yet merged into `main`.
-6. **Further production-minded improvements** — future: additional error handling, observability, and realistic load tests.
+5. **Overload protection / backpressure** — complete on `main`; PR #4 merged, 14 unit tests passed and rate-controlled overload verified.
+6. **Reliability & observability** — JSON access logs, request IDs, readiness, in-process counters and sanitized failure responses implemented in `feature/reliability-observability` for validation; not yet merged.
+7. **Further production-minded improvements** — future: richer monitoring, authentication, dashboards, and multi-worker behavior.
 
 This project is meant to evolve incrementally, with measurements informing each subsequent design decision.
