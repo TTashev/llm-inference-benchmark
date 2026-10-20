@@ -75,7 +75,9 @@ class BenchmarkMetricTests(unittest.TestCase):
     def test_send_request_classifies_503_as_rejection(self):
         response = Mock()
         response.status_code = 503
-        with patch("benchmark.requests.post", return_value=response):
+        session = Mock()
+        session.post.return_value = response
+        with patch("benchmark.http_session", return_value=session):
             result = send_request(
                 "http://127.0.0.1:8000/generate",
                 {"prompt": "test", "max_new_tokens": 1},

@@ -4,7 +4,6 @@ import asyncio
 import os
 import threading
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -13,31 +12,25 @@ import main
 
 
 class SlowFakeGenerator:
-    tokenizer = SimpleNamespace(eos_token_id=0)
-
     def __init__(self, started: threading.Event, release: threading.Event):
         self.started = started
         self.release = release
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, prompts, max_new_tokens):
         self.started.set()
         if not self.release.wait(timeout=5):
             raise RuntimeError("Timed out waiting for test to release inference")
-        return [{"generated_text": "fake completion"}]
+        return ["fake completion"] * len(prompts)
 
 
 class FailingFakeGenerator:
-    tokenizer = SimpleNamespace(eos_token_id=0)
-
-    def __call__(self, *args, **kwargs):
+    def __call__(self, prompts, max_new_tokens):
         raise RuntimeError("simulated inference failure")
 
 
 class FastFakeGenerator:
-    tokenizer = SimpleNamespace(eos_token_id=0)
-
-    def __call__(self, *args, **kwargs):
-        return [{"generated_text": "fake completion"}]
+    def __call__(self, prompts, max_new_tokens):
+        return ["fake completion"] * len(prompts)
 
 
 class AdmissionTests(unittest.TestCase):
@@ -85,43 +78,49 @@ class AdmissionTests(unittest.TestCase):
             asyncio.run(scenario())
 
     def test_admits_two_and_rejects_third(self):
-        entered = 0
-        both_admitted = asyncio.Event()
-        release = asyncio.Event()
-
-        async def fake_threadpool(_fn, _request):
-            nonlocal entered
-            entered += 1
-            if entered == 2:
-                both_admitted.set()
-            await release.wait()
-            return main.GenerateResponse(
-                generated_text="fake",
-                max_new_tokens=1,
-                inference_time_ms=0,
-                lock_wait_ms=0,
-            )
+        started = threading.Event()
+        release = threading.Event()
 
         async def scenario():
             first = asyncio.create_task(main.generate(self.request))
-            second = asyncio.create_task(main.generate(self.request))
             try:
-                await asyncio.wait_for(both_admitted.wait(), timeout=3)
+                self.assertTrue(await asyncio.to_thread(started.wait, 3))
+                # The second request is admitted and queued behind the first batch.
+                second = asyncio.create_task(main.generate(self.request))
+                await asyncio.sleep(0)
                 with self.assertRaises(HTTPException) as caught:
                     await main.generate(self.request)
                 self.assertEqual(caught.exception.status_code, 503)
             finally:
                 release.set()
-                await asyncio.gather(first, second)
+            responses = await asyncio.gather(first, second)
+            self.assertEqual(
+                [response.generated_text for response in responses],
+                ["fake completion", "fake completion"],
+            )
 
             response = await main.generate(self.request)
-            self.assertEqual(response.generated_text, "fake")
+            self.assertEqual(response.generated_text, "fake completion")
 
         with (
+            patch.object(main, "generator", SlowFakeGenerator(started, release)),
             patch.object(main, "inference_slots", threading.BoundedSemaphore(2)),
-            patch.object(main, "run_in_threadpool", fake_threadpool),
         ):
             asyncio.run(scenario())
+
+    def test_batch_wait_must_be_non_negative(self):
+        for invalid in ("-1", "nan", "inf", "not-a-number"):
+            with self.subTest(invalid=invalid):
+                with patch.dict(os.environ, {"BATCH_WAIT_MS": invalid}):
+                    with self.assertRaises(ValueError):
+                        main.read_batch_wait_ms()
+
+    def test_batch_size_must_be_positive(self):
+        for invalid in ("0", "-1", "not-a-number"):
+            with self.subTest(invalid=invalid):
+                with patch.dict(os.environ, {"MAX_BATCH_SIZE": invalid}):
+                    with self.assertRaises(ValueError):
+                        main.read_max_batch_size()
 
     def test_capacity_must_be_positive(self):
         for invalid in ("0", "-1", "not-a-number"):

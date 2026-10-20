@@ -3,6 +3,7 @@
 import argparse
 import csv
 import statistics
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -69,11 +70,23 @@ def nonnegative_int(value: str) -> int:
     return number
 
 
+_thread_local = threading.local()
+
+
+def http_session() -> requests.Session:
+    """Per-thread session so each client worker reuses its keep-alive connection
+    instead of opening a new TCP connection for every request."""
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = _thread_local.session = requests.Session()
+    return session
+
+
 def send_request(url: str, payload: dict) -> RequestResult:
     start = time.perf_counter()
 
     try:
-        response = requests.post(url, json=payload, timeout=60)
+        response = http_session().post(url, json=payload, timeout=60)
         # 503 is deliberate overload shedding by our inference server.
         if response.status_code == 503:
             return RequestResult(

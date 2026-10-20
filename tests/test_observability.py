@@ -4,7 +4,6 @@ import json
 import re
 import threading
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import main
@@ -12,16 +11,12 @@ from observability import ServiceMetrics
 
 
 class WorkingGenerator:
-    tokenizer = SimpleNamespace(eos_token_id=0)
-
-    def __call__(self, *args, **kwargs):
-        return [{"generated_text": "fake completion"}]
+    def __call__(self, prompts, max_new_tokens):
+        return ["fake completion"] * len(prompts)
 
 
 class BrokenGenerator:
-    tokenizer = SimpleNamespace(eos_token_id=0)
-
-    def __call__(self, *args, **kwargs):
+    def __call__(self, prompts, max_new_tokens):
         raise RuntimeError("secret user prompt: please do not expose me")
 
 
