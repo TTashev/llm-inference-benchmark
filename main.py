@@ -1,4 +1,4 @@
-"""Tiny CPU inference service with bounded request admission."""
+"""Tiny CPU inference service with admission control and observability."""
 
 import os
 import threading
@@ -8,6 +8,12 @@ from contextlib import asynccontextmanager
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
+from observability import (
+    RequestObservabilityMiddleware,
+    ServiceMetrics,
+    log_event,
+    request_logging_enabled,
+)
 from pydantic import BaseModel, Field
 from transformers import pipeline
 
@@ -30,6 +36,7 @@ inference_lock = threading.Lock()
 # Non-blocking admission at the async HTTP handler, before work reaches the
 # worker thread pool. Each slot covers both inference and waiting for the lock.
 inference_slots = threading.BoundedSemaphore(MAX_IN_FLIGHT)
+service_metrics = ServiceMetrics()
 
 torch.set_num_threads(1)
 
@@ -38,22 +45,36 @@ torch.set_num_threads(1)
 async def lifespan(app: FastAPI):
     global generator
 
-    print("PyTorch CPU threads:", torch.get_num_threads())
-    print("Maximum admitted inference requests:", MAX_IN_FLIGHT)
-    print("Loading AI model...")
-
-    generator = pipeline(
-        "text-generation",
+    log_event(
+        "model_loading",
         model="sshleifer/tiny-gpt2",
-        device="cpu",
+        pytorch_cpu_threads=torch.get_num_threads(),
+        max_in_flight=MAX_IN_FLIGHT,
     )
+    try:
+        generator = pipeline(
+            "text-generation",
+            model="sshleifer/tiny-gpt2",
+            device="cpu",
+        )
+    except Exception as exc:
+        log_event("model_load_failed", error_type=type(exc).__name__)
+        raise
 
-    print("Model ready!")
-    yield
-    generator = None
+    log_event("model_ready")
+    try:
+        yield
+    finally:
+        generator = None
+        log_event("model_unloaded")
 
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    RequestObservabilityMiddleware,
+    metrics=service_metrics,
+    log_requests=request_logging_enabled(),
+)
 
 
 class GenerateRequest(BaseModel):
@@ -69,8 +90,23 @@ class GenerateResponse(BaseModel):
 
 
 @app.get("/health")
-def health():
+async def health():
+    """Lightweight liveness endpoint; does not test model readiness."""
     return {"status": "ok"}
+
+
+@app.get("/ready")
+async def ready():
+    """Only ready when a model pipeline has finished loading."""
+    if generator is None:
+        raise HTTPException(status_code=503, detail="Model not ready")
+    return {"status": "ready"}
+
+
+@app.get("/metrics")
+async def metrics():
+    """Process-local cumulative counters; protect this endpoint in deployments."""
+    return {"max_in_flight": MAX_IN_FLIGHT, **service_metrics.snapshot()}
 
 
 def run_inference(request: GenerateRequest) -> GenerateResponse:
@@ -90,6 +126,7 @@ def run_inference(request: GenerateRequest) -> GenerateResponse:
 
         inference_time_ms = (time.perf_counter() - start_inference) * 1000
 
+    service_metrics.record_inference(inference_time_ms, lock_wait_ms)
     return GenerateResponse(
         generated_text=result[0]["generated_text"],
         max_new_tokens=request.max_new_tokens,
@@ -109,7 +146,9 @@ async def generate(request: GenerateRequest):
             headers={"Retry-After": "1"},
         )
 
+    service_metrics.admitted()
     try:
         return await run_in_threadpool(run_inference, request)
     finally:
+        service_metrics.released()
         inference_slots.release()
