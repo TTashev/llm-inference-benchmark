@@ -157,7 +157,7 @@ python benchmark.py
 Windows (without activating the virtual environment):
 
 ```powershell
-.\\.venv\\Scripts\\python.exe benchmark.py
+.\.venv\Scripts\python.exe benchmark.py
 ```
 
 The baseline benchmark warms up the model with five requests and sends 50 requests at each concurrency level: 1, 2, 4, and 8. It prints aggregate throughput, mean client latency, mean inference time, mean lock wait, remaining overhead, and failures.
