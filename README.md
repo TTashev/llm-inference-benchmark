@@ -17,27 +17,29 @@ FastAPI application (main.py)
         |
         | request validation (Pydantic)
         v
-Admission limit (MAX_IN_FLIGHT, default 4)
+Admission limit (MAX_IN_FLIGHT, default 64)
         |                    \\
         | admitted            \\ full -> HTTP 503 + Retry-After
         v
-Worker thread pool
+Request queue
         |
         v
-Shared inference lock
+Single batcher thread (owns the model)
         |
-        | one inference call at a time
+        | drains up to MAX_BATCH_SIZE (default 32) queued requests
         v
-Hugging Face text-generation pipeline
+Batched greedy decoding with KV cache
         |
         | Tiny GPT-2 + PyTorch on CPU
         v
 JSON response (generated text + timing)
 ```
 
-The model is loaded **once at application startup** and reused for incoming requests. The `/generate` handler is asynchronous so it can make a **non-blocking admission decision before submitting the blocking model call to the worker thread pool**. An explicit lock still serializes access to the shared text-generation pipeline.
+The model is loaded **once at application startup** and reused for incoming requests. The `/generate` handler is asynchronous so it can make a **non-blocking admission decision before queueing the request for the model**.
 
-For each server process, `MAX_IN_FLIGHT` (default **4**) limits the number of admitted generation requests, including both **1 running inference** and requests waiting for the inference lock. When all permits are occupied, the server immediately responds with **HTTP 503 Service Unavailable**, `Retry-After: 1`, and a JSON error instead of accepting another inference request.
+A single background thread (`MicroBatcher` in `batched_inference.py`) owns the model. Whenever it becomes free it takes **every queued request, up to `MAX_BATCH_SIZE`**, and decodes them together, one forward pass per token for the whole batch. Under low load a request runs alone with no added wait; under concurrent load requests share forward passes instead of waiting for the model one at a time. Decoding is greedy with a KV cache (`GreedyBatchGenerator`); prompts with the same token length are batched together, so no padding is needed and each response's text is identical to the `text-generation` pipeline with `do_sample=False`.
+
+For each server process, `MAX_IN_FLIGHT` (default **64**) limits the number of admitted generation requests, including running and queued inference. When all permits are occupied, the server immediately responds with **HTTP 503 Service Unavailable**, `Retry-After: 1`, and a JSON error instead of accepting another inference request.
 
 ## Features
 
@@ -46,8 +48,8 @@ The following functionality is available on `main`:
 - `GET /health` — basic health endpoint.
 - `POST /generate` — generate text using `sshleifer/tiny-gpt2`.
 - Pydantic validation for `prompt` and `max_new_tokens` (1–256, default 50).
-- Model loaded once at startup, CPU inference with one PyTorch thread, and shared-lock serialization.
-- Response timings: `inference_time_ms` (inside the lock) and `lock_wait_ms` (waiting to acquire the lock).
+- Model loaded once at startup, CPU inference with one PyTorch thread, and dynamic micro-batching of concurrent requests.
+- Response fields: `inference_time_ms` (time to decode the request's batch), `lock_wait_ms` (time queued before the batch started; name kept for benchmark compatibility), and `batch_size`.
 - Benchmark metrics: request counts, failures, throughput, average latency, p50/p95/p99 client latency, average inference time, lock wait, and residual overhead.
 - Configurable workloads: request count, concurrency levels, repeated runs, warm-up, prompt, token count, endpoint, and CSV destination.
 - CSV summary export and unit tests for benchmark calculations.
@@ -152,7 +154,8 @@ A successful JSON response includes:
   "generated_text": "Once upon a time ...",
   "max_new_tokens": 20,
   "inference_time_ms": 30.0,
-  "lock_wait_ms": 0.0
+  "lock_wait_ms": 0.0,
+  "batch_size": 1
 }
 ```
 
@@ -258,7 +261,7 @@ The CSV contains one summary row per concurrency level and run, with a timestamp
 
 ### Overload and backpressure experiment
 
-You can control per-process admission capacity through `MAX_IN_FLIGHT` (**default: 4**). It limits all accepted `/generate` requests, **not** the number of parallel model calls. The model lock still permits only one inference call at a time.
+You can control per-process admission capacity through `MAX_IN_FLIGHT` (**default: 64**). It limits all accepted `/generate` requests (queued and running), **not** the batch size. `MAX_BATCH_SIZE` (**default: 32**) limits how many queued requests are decoded together. Set `MAX_IN_FLIGHT=4` to reproduce the earlier overload experiments with a small admission limit.
 
 Windows PowerShell — set the limit **in the terminal that starts the server**:
 
@@ -325,21 +328,21 @@ This is a basic **constant-rate open-loop load generator** for local learning, n
 | Throughput (req/s) | Successful responses divided by total elapsed time per workload |
 | Mean client latency | Mean end-to-end HTTP request duration for successful requests |
 | p50 / p95 / p99 latency | Median, 95th, and 99th percentile client latency |
-| Inference time | Time spent executing the model pipeline after the inference lock is acquired |
-| Lock wait | Time waiting to acquire the shared inference lock |
+| Inference time | Time spent decoding the batch that contained the request |
+| Lock wait | Time the request spent queued before its batch started on the model |
 | Other overhead | Mean client latency minus mean inference time minus mean lock wait (HTTP, scheduling, and remaining overhead) |
 | Rejected (HTTP 503) | Requests deliberately rejected because inference admission capacity is full (Milestone 4) |
 | Rejection rate | Share of all attempted requests receiving HTTP 503 (Milestone 4 feature branch) |
 | Avg rejection latency | Mean end-to-end client time for rejected requests (Milestone 4 feature branch) |
 | Errors | Other failed requests, separate from HTTP 503 overload responses in Milestone 4; failures are excluded from successful-request latency percentiles |
 
-**Note:** More concurrent requests do not necessarily increase throughput when inference is serialized. Percentiles measured over small samples, especially p99, should be interpreted cautiously.
+**Note:** Throughput only grows with concurrency because concurrent requests are batched; a single client is still limited by one request's decode time. Percentiles measured over small samples, especially p99, should be interpreted cautiously.
 
 ## Model and limitations
 
 - Model: [sshleifer/tiny-gpt2](https://huggingface.co/sshleifer/tiny-gpt2), used to test the serving pipeline rather than to provide useful text generation.
 - `torch.set_num_threads(1)` is configured in `main.py` for the current tiny CPU model. This is an experimental configuration, **not a universal recommendation**.
-- Inference is serialized by a mutex; this simplifies behavior but limits concurrency.
+- One thread owns the model and decodes batches sequentially; a batch must finish before newly queued requests start (no continuous/in-flight batching).
 - Benchmarks are local and short. Results depend on CPU resources, OS, VM configuration, background load, and software versions.
 - The `main` branch includes bounded admission; metrics and structured logs are under review in the reliability/observability feature branch.
 - The service is not yet production-hardened: it lacks comprehensive authentication, error handling, monitoring, and distributed admission control.
@@ -357,6 +360,19 @@ The following are **user-reported measurements** from a Windows host (not perfor
 | 8 | 33.30 | 238.40 | 243.84 | 199.01 |
 
 All 2,000 requests succeeded. Throughput leveled off around 33 req/s while lock-wait and end-to-end latency increased with concurrency. Hardware, software versions, and background activity affect results; repeat tests before drawing robust performance conclusions.
+
+**After dynamic batching** (2-vCPU Linux VM, client and server on the same machine, `python benchmark.py --requests 1000 --concurrency 1,4,8,16,32,64`, default `MAX_IN_FLIGHT=64` / `MAX_BATCH_SIZE=32`):
+
+| Concurrent clients | Throughput (req/s) | Mean latency (ms) | p95 latency (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 55.63 | 17.94 | 29.99 |
+| 4 | 148.94 | 26.72 | 37.51 |
+| 8 | 236.02 | 33.72 | 50.79 |
+| 16 | 387.15 | 40.68 | 52.52 |
+| 32 | 510.64 | 61.49 | 80.83 |
+| 64 | 665.57 | 89.80 | 191.83 |
+
+The serialized server measured about 50 req/s on the same VM. Throughput now depends on how many requests are concurrent, not only on one decode's latency.
 
 ## Project roadmap
 
