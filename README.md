@@ -17,6 +17,13 @@ FastAPI application (main.py)
         |
         | request validation (Pydantic)
         v
+Admission limit (MAX_IN_FLIGHT, default 4)
+        |                    \\
+        | admitted            \\ full -> HTTP 503 + Retry-After
+        v
+Worker thread pool
+        |
+        v
 Shared inference lock
         |
         | one inference call at a time
