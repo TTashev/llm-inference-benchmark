@@ -30,25 +30,20 @@ JSON response (generated text + timing)
 
 The model is loaded **once at application startup** and reused for incoming requests. The `/generate` handler is synchronous; FastAPI executes synchronous handlers in a thread pool. An explicit lock serializes access to the shared text-generation pipeline for our initial, controlled concurrency experiments.
 
-## Features and branch status
+## Features
 
-The following are available on `main`:
+The following functionality is available on `main`:
 
 - `GET /health` — basic health endpoint.
 - `POST /generate` — generate text using `sshleifer/tiny-gpt2`.
 - Pydantic validation for `prompt` and `max_new_tokens` (1–256, default 50).
-- Model loaded once at startup, CPU execution with one PyTorch thread, and serialized inference using a shared lock.
-- Response timings: `inference_time_ms` (model pipeline execution inside the lock) and `lock_wait_ms` (time waiting to acquire the lock).
-- Baseline benchmark: 50 requests at each concurrency level (1, 2, 4, 8), showing throughput, successful/failed requests, mean client latency, inference time, lock wait, and remaining overhead.
+- Model loaded once at startup, CPU inference with one PyTorch thread, and shared-lock serialization.
+- Response timings: `inference_time_ms` (inside the lock) and `lock_wait_ms` (waiting to acquire the lock).
+- Benchmark metrics: request counts, failures, throughput, average latency, p50/p95/p99 client latency, average inference time, lock wait, and residual overhead.
+- Configurable workloads: request count, concurrency levels, repeated runs, warm-up, prompt, token count, endpoint, and CSV destination.
+- CSV summary export and unit tests for benchmark calculations.
 
-**Important branch note (October 2026):** Both [PR #1](https://github.com/TTashev/llm-inference-benchmark/pull/1) and [PR #2](https://github.com/TTashev/llm-inference-benchmark/pull/2) are marked merged, but PR #2 was merged into `feature/lock-wait-metrics` *after* that branch had already been merged into `main`. Consequently, `main` **does not yet include** PR #2's benchmark improvements. The enhanced benchmark and its tests currently live on `feature/lock-wait-metrics`:
-
-- p50, p95, and p99 client-latency percentiles (linear interpolation)
-- Configurable number of requests, concurrency levels, repeats, warm-up, prompt, model token count, URL, and output file
-- CSV summaries (one row per run and concurrency setting)
-- Unit tests for percentile calculations, argument validation, and successful/failed request accounting
-
-See [Enhanced benchmark](#enhanced-benchmark-feature-branch) for usage. A follow-up integration into `main` is still required.
+The benchmark improvements were developed in [PR #2](https://github.com/TTashev/llm-inference-benchmark/pull/2); lock-wait instrumentation was developed in [PR #1](https://github.com/TTashev/llm-inference-benchmark/pull/1).
 
 ## Requirements
 
@@ -146,7 +141,7 @@ The text and timing shown above are **illustrative**, not guaranteed output.
 
 Leave the inference server running and open a second terminal in the repository.
 
-### Baseline benchmark (`main`)
+### Benchmark usage
 
 Linux (with virtual environment activated):
 
@@ -160,43 +155,32 @@ Windows (without activating the virtual environment):
 .\.venv\Scripts\python.exe benchmark.py
 ```
 
-The baseline benchmark warms up the model with five requests and sends 50 requests at each concurrency level: 1, 2, 4, and 8. It prints aggregate throughput, mean client latency, mean inference time, mean lock wait, remaining overhead, and failures.
+By default, the client warms up with five requests, then sends 50 requests at each concurrency level (1, 2, 4, and 8).
 
-### Enhanced benchmark (feature branch)
-
-To use the new p50/p95/p99 and CSV functionality from merged PR #2, switch to the branch that currently contains it:
-
-```bash
-git fetch origin
-git switch feature/lock-wait-metrics
-```
-
-If that branch is not available locally, use `git switch --track origin/feature/lock-wait-metrics`.
-
-With the server running, execute:
+For a larger workload:
 
 ```bash
 python benchmark.py --requests 500 --concurrency 1,2,4,8
 ```
 
-For three repeated runs and a custom CSV destination:
+For three repetitions per concurrency level:
 
 ```bash
 python benchmark.py --requests 200 --concurrency 1,2,4,8 --runs 3 --output benchmark_results.csv
 ```
 
-Use `python benchmark.py --help` to see all parameters. Available options include:
+Use `python benchmark.py --help` to see the full CLI. Options include:
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--requests` | `50` | Number of requests at each concurrency level per run |
-| `--concurrency` | `1,2,4,8` | Comma-separated number of simultaneous benchmark clients |
-| `--runs` | `1` | Number of complete benchmark repetitions |
-| `--warmup` | `5` | Warm-up requests before measurements |
-| `--max-new-tokens` | `20` | Tokens requested per inference call |
-| `--prompt` | `Once upon a time` | Generation prompt |
+| `--requests` | `50` | Requests per concurrency level and run |
+| `--concurrency` | `1,2,4,8` | Comma-separated simultaneous client counts |
+| `--runs` | `1` | Number of repeated benchmark runs |
+| `--warmup` | `5` | Warm-up requests before measurement |
+| `--max-new-tokens` | `20` | Generated tokens requested per call |
+| `--prompt` | `Once upon a time` | Input prompt |
 | `--url` | `http://127.0.0.1:8000/generate` | Target endpoint |
-| `--output` | `benchmark_results.csv` | CSV summary output path (overwritten on each run) |
+| `--output` | `benchmark_results.csv` | CSV summary file, overwritten each invocation |
 
 Run unit tests:
 
@@ -204,7 +188,7 @@ Run unit tests:
 python -m unittest discover -s tests -v
 ```
 
-The enhanced benchmark writes **one CSV summary row per concurrency level and run**, including a timestamp, workload configuration, successes/errors, throughput, mean latency, p50/p95/p99, model inference time, lock wait, and other overhead. With `--runs 3` and four concurrency levels, this produces 12 summary rows.
+The CSV contains one summary row per concurrency level and run, with a timestamp, request counts, failures, throughput, average latency, p50/p95/p99, inference time, lock wait, and residual overhead. Four concurrency levels and three runs produce 12 summary rows.
 
 ### Understanding the metrics
 
@@ -212,7 +196,7 @@ The enhanced benchmark writes **one CSV summary row per concurrency level and ru
 | --- | --- |
 | Throughput (req/s) | Successful responses divided by total elapsed time per workload |
 | Mean client latency | Mean end-to-end HTTP request duration for successful requests |
-| p50 / p95 / p99 latency | Median, 95th, and 99th percentile client latency (enhanced benchmark only) |
+| p50 / p95 / p99 latency | Median, 95th, and 99th percentile client latency |
 | Inference time | Time spent executing the model pipeline after the inference lock is acquired |
 | Lock wait | Time waiting to acquire the shared inference lock |
 | Other overhead | Mean client latency minus mean inference time minus mean lock wait (HTTP, scheduling, and remaining overhead) |
@@ -246,7 +230,7 @@ All 2,000 requests succeeded. Throughput leveled off around 33 req/s while lock-
 
 1. **HTTP API and validation** — complete on `main`.
 2. **CPU model inference** — complete on `main`.
-3. **Benchmarking and metrics** — enhanced features implemented and tested on Windows; **still need integrating into `main`** because PR #2 merged into a feature branch.
+3. **Benchmarking and metrics** — complete: CLI configuration, p50/p95/p99, CSV export, and unit tests.
 4. **Performance investigations** — current experiments cover CPU threading and mutex contention; lock-wait instrumentation is on `main`.
 5. **Production-minded improvements** — planned: bounded request admission, overload/backpressure handling, better error reporting, and more testing.
 
