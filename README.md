@@ -89,6 +89,7 @@ python -m pip install fastapi uvicorn transformers requests
 
 ```powershell
 py -3.11 -m venv .venv
+ .\.venv\Scripts\activate
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 .\.venv\Scripts\python.exe -m pip install fastapi uvicorn transformers requests
