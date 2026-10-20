@@ -18,6 +18,7 @@ class RequestResult:
     inference_s: float | None = None
     lock_wait_s: float | None = None
     error: str | None = None
+    rejected: bool = False
 
 
 def percentile(values: list[float], percent: float) -> float:
@@ -73,6 +74,12 @@ def send_request(url: str, payload: dict) -> RequestResult:
 
     try:
         response = requests.post(url, json=payload, timeout=60)
+        # 503 is deliberate overload shedding by our inference server.
+        if response.status_code == 503:
+            return RequestResult(
+                latency_s=time.perf_counter() - start,
+                rejected=True,
+            )
         response.raise_for_status()
         data = response.json()
 
@@ -101,7 +108,9 @@ def summarize(
     payload: dict,
     url: str,
 ) -> dict:
-    successful = [result for result in results if result.error is None]
+    successful = [result for result in results if result.error is None and not result.rejected]
+    rejected = [result for result in results if result.rejected]
+    errors = [result for result in results if result.error is not None]
     latency = [result.latency_s for result in successful]
 
     def milliseconds(seconds: float | None) -> float | None:
@@ -113,7 +122,12 @@ def summarize(
         "concurrency": concurrency,
         "requests": len(results),
         "successful": len(successful),
-        "errors": len(results) - len(successful),
+        "rejected_503": len(rejected),
+        "rejection_rate_pct": round(100 * len(rejected) / len(results), 2) if results else 0.0,
+        "avg_rejection_latency_ms": milliseconds(
+            statistics.mean(result.latency_s for result in rejected)
+        ) if rejected else None,
+        "errors": len(errors),
         "duration_s": round(duration_s, 3),
         "throughput_rps": round(len(successful) / duration_s, 2) if duration_s > 0 else 0.0,
         "avg_latency_ms": milliseconds(statistics.mean(latency)) if latency else None,
@@ -155,6 +169,12 @@ def run_benchmark(
 
     print(f"\nRun {run} | concurrency {concurrency} | {summary['successful']}/{requests_count} succeeded")
     print(f"Throughput: {summary['throughput_rps']:.2f} req/s")
+    print(
+        f"Rejected (HTTP 503): {summary['rejected_503']} "
+        f"({summary['rejection_rate_pct']:.2f}%)"
+    )
+    if summary["rejected_503"]:
+        print(f"Avg rejection latency: {summary['avg_rejection_latency_ms']:.2f} ms")
     if summary["successful"]:
         print(
             "Client latency: "
@@ -190,8 +210,9 @@ def main() -> None:
     payload = {"prompt": args.prompt, "max_new_tokens": args.max_new_tokens}
     for index in range(args.warmup):
         result = send_request(args.url, payload)
-        if result.error is not None:
-            parser.error(f"Warm-up request {index + 1} failed: {result.error}")
+        if result.error is not None or result.rejected:
+            reason = "HTTP 503: overloaded" if result.rejected else result.error
+            parser.error(f"Warm-up request {index + 1} failed: {reason}")
 
     rows = []
     for run in range(1, args.runs + 1):
