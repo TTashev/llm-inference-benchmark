@@ -225,9 +225,42 @@ python benchmark.py --requests 200 --concurrency 1,2,4,8,16,32 --output benchmar
 
 As load increases beyond admitted capacity, some requests will return **503**, which is an **expected overload response** rather than an unexpected inference failure. The enhanced benchmark reports the number of rejected requests, rejection rate, average rejection latency, successful throughput, and latency percentiles **for successful requests only**. The CSV records `rejected_503`, `rejection_rate_pct`, and `avg_rejection_latency_ms`; the `errors` field now counts other failures separately.
 
-Note that the benchmark is a **closed-loop client workload**: fast 503 responses let a worker send another request quickly. Thus, rejection percentages depend on the load generator and should not be interpreted as an arrival-rate or production capacity estimate.
+Note that **`benchmark.py`** is a **closed-loop client workload**: fast 503 responses let a worker send another request quickly. Thus, its rejection percentages depend on the load generator and should not be interpreted as an arrival-rate or production capacity estimate. Use the rate-controlled experiment below to study sustained offered load.
 
 This limit applies **per Uvicorn worker process**. To keep the experiment interpretable, run **one Uvicorn worker**. It is not a global limit across multiple workers or servers, and does not bound TCP or web-server queues before FastAPI receives a request. There is no retry mechanism in the benchmark; clients are responsible for respecting `Retry-After` if they retry in a real application.
+
+### Rate-controlled benchmark (fixed arrival rate)
+
+Use `rate_benchmark.py` to test sustained offered load without waiting for a prior HTTP response before scheduling another request. This is more appropriate than the closed-loop `benchmark.py` when investigating backpressure and admission limits.
+
+With a **single-worker** Uvicorn server running and `MAX_IN_FLIGHT=4`, execute in a separate terminal:
+
+```bash
+python rate_benchmark.py --rates 20,30,40,60 --duration 10 --output benchmark_results_rate.csv
+```
+
+For more stable observations, use 20 seconds per rate, repeat the set three times, and leave the client default of 64 worker threads unless scheduling warnings appear:
+
+```bash
+python rate_benchmark.py --rates 20,30,40,60 --duration 20 --runs 3 --workers 64
+```
+
+The default settings are `--rates 20,30,40,60`, `--duration 10` seconds, `--workers 64`, `--runs 1`, `--warmup 5`, and `--pause 1` second between rate tests. As with `benchmark.py`, the prompt, target URL, token count, and CSV destination are configurable; see `python rate_benchmark.py --help`.
+
+This client schedules arrivals at absolute monotonic-clock times, with one new request every `1 / rate` seconds. It does **not** automatically retry HTTP 503 rejections. Each rate has a fixed arrival window; requests still running when the window ends are allowed to finish before statistics are printed.
+
+The output and CSV include:
+- **`target_rate_rps`** — requested send schedule in requests per second
+- **`observed_start_rps`** — number of HTTP calls actually started during the scheduling window divided by its duration
+- **`scheduled_requests` / `client_skipped`** — intended arrivals and requests the client could not launch because all of its worker slots were occupied; these are **not** server rejections
+- **`p95_start_lag_ms` / `max_start_lag_ms`** — delay between the scheduled request time and when a client thread actually started it
+- **`successful`, `rejected_503`, `rejection_rate_pct`, `errors`** — server outcomes among HTTP requests actually sent
+- **`throughput_rps`** — successful responses divided by the full benchmark wall time, including time spent draining outstanding requests; compare this alongside offered rate and actual starts
+- **`p50_latency_ms`, `p95_latency_ms`, `p99_latency_ms`** — latency percentiles of successful requests only
+
+A warning means client dispatch was delayed by more than one arrival interval at p95 or requests were skipped locally. Increase `--workers` or lower `--rates` before interpreting these results as server capacity.
+
+This is a basic **constant-rate open-loop load generator** for local learning, not a production load-testing platform. The Python client, Windows timer granularity, CPU contention (particularly when server and benchmark share the same machine), and short test duration can introduce scheduling jitter. Repeated runs and monitoring system utilization make conclusions more reliable.
 
 ### Understanding the metrics
 
@@ -275,7 +308,7 @@ All 2,000 requests succeeded. Throughput leveled off around 33 req/s while lock-
 2. **CPU model inference** — complete on `main`.
 3. **Benchmarking and metrics** — complete: CLI configuration, p50/p95/p99, CSV export, and unit tests.
 4. **Performance investigations** — CPU threading and mutex contention measured; lock-wait instrumentation is on `main`.
-5. **Overload protection / backpressure** — implemented in `feature/bounded-admission-backpressure` for testing and PR review; not yet merged into `main`.
+5. **Overload protection / backpressure** — bounded admission, HTTP 503 handling, and fixed-rate load-generation implemented in `feature/bounded-admission-backpressure` for validation; not yet merged into `main`.
 6. **Further production-minded improvements** — future: additional error handling, observability, and realistic load tests.
 
 This project is meant to evolve incrementally, with measurements informing each subsequent design decision.
