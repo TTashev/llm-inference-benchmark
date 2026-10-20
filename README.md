@@ -17,6 +17,13 @@ FastAPI application (main.py)
         |
         | request validation (Pydantic)
         v
+Admission limit (MAX_IN_FLIGHT, default 4)
+        |                    \\
+        | admitted            \\ full -> HTTP 503 + Retry-After
+        v
+Worker thread pool
+        |
+        v
 Shared inference lock
         |
         | one inference call at a time
@@ -28,7 +35,9 @@ Hugging Face text-generation pipeline
 JSON response (generated text + timing)
 ```
 
-The model is loaded **once at application startup** and reused for incoming requests. The `/generate` handler is synchronous; FastAPI executes synchronous handlers in a thread pool. An explicit lock serializes access to the shared text-generation pipeline for our initial, controlled concurrency experiments.
+The model is loaded **once at application startup** and reused for incoming requests. The `/generate` handler is asynchronous so it can make a **non-blocking admission decision before submitting the blocking model call to the worker thread pool**. An explicit lock still serializes access to the shared text-generation pipeline.
+
+For each server process, `MAX_IN_FLIGHT` (default **4**) limits the number of admitted generation requests, including both **1 running inference** and requests waiting for the inference lock. When all permits are occupied, the server immediately responds with **HTTP 503 Service Unavailable**, `Retry-After: 1`, and a JSON error instead of accepting another inference request.
 
 ## Features
 
@@ -42,6 +51,7 @@ The following functionality is available on `main`:
 - Benchmark metrics: request counts, failures, throughput, average latency, p50/p95/p99 client latency, average inference time, lock wait, and residual overhead.
 - Configurable workloads: request count, concurrency levels, repeated runs, warm-up, prompt, token count, endpoint, and CSV destination.
 - CSV summary export and unit tests for benchmark calculations.
+- **Milestone 4 (feature branch):** bounded inference admission, HTTP 503 overload rejection, and benchmark rejection counters. These changes are under review and are not on `main` yet.
 
 The benchmark improvements were developed in [PR #2](https://github.com/TTashev/llm-inference-benchmark/pull/2); lock-wait instrumentation was developed in [PR #1](https://github.com/TTashev/llm-inference-benchmark/pull/1).
 
@@ -190,6 +200,68 @@ python -m unittest discover -s tests -v
 
 The CSV contains one summary row per concurrency level and run, with a timestamp, request counts, failures, throughput, average latency, p50/p95/p99, inference time, lock wait, and residual overhead. Four concurrency levels and three runs produce 12 summary rows.
 
+### Overload and backpressure experiment (feature branch)
+
+On `feature/bounded-admission-backpressure`, you can control per-process admission capacity through `MAX_IN_FLIGHT` (**default: 4**). It limits all accepted `/generate` requests, **not** the number of parallel model calls. The model lock still permits only one inference call at a time.
+
+Windows PowerShell — set the limit **in the terminal that starts the server**:
+
+```powershell
+$env:MAX_IN_FLIGHT = "4"
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+Linux:
+
+```bash
+MAX_IN_FLIGHT=4 python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+From a second terminal, run the benchmark:
+
+```bash
+python benchmark.py --requests 200 --concurrency 1,2,4,8,16,32 --output benchmark_results_overload.csv
+```
+
+As load increases beyond admitted capacity, some requests will return **503**, which is an **expected overload response** rather than an unexpected inference failure. The enhanced benchmark reports the number of rejected requests, rejection rate, average rejection latency, successful throughput, and latency percentiles **for successful requests only**. The CSV records `rejected_503`, `rejection_rate_pct`, and `avg_rejection_latency_ms`; the `errors` field now counts other failures separately.
+
+Note that **`benchmark.py`** is a **closed-loop client workload**: fast 503 responses let a worker send another request quickly. Thus, its rejection percentages depend on the load generator and should not be interpreted as an arrival-rate or production capacity estimate. Use the rate-controlled experiment below to study sustained offered load.
+
+This limit applies **per Uvicorn worker process**. To keep the experiment interpretable, run **one Uvicorn worker**. It is not a global limit across multiple workers or servers, and does not bound TCP or web-server queues before FastAPI receives a request. There is no retry mechanism in the benchmark; clients are responsible for respecting `Retry-After` if they retry in a real application.
+
+### Rate-controlled benchmark (fixed arrival rate)
+
+Use `rate_benchmark.py` to test sustained offered load without waiting for a prior HTTP response before scheduling another request. This is more appropriate than the closed-loop `benchmark.py` when investigating backpressure and admission limits.
+
+With a **single-worker** Uvicorn server running and `MAX_IN_FLIGHT=4`, execute in a separate terminal:
+
+```bash
+python rate_benchmark.py --rates 20,30,40,60 --duration 10 --output benchmark_results_rate.csv
+```
+
+For more stable observations, use 20 seconds per rate, repeat the set three times, and leave the client default of 64 worker threads unless scheduling warnings appear:
+
+```bash
+python rate_benchmark.py --rates 20,30,40,60 --duration 20 --runs 3 --workers 64
+```
+
+The default settings are `--rates 20,30,40,60`, `--duration 10` seconds, `--workers 64`, `--runs 1`, `--warmup 5`, and `--pause 1` second between rate tests. As with `benchmark.py`, the prompt, target URL, token count, and CSV destination are configurable; see `python rate_benchmark.py --help`.
+
+This client schedules arrivals at absolute monotonic-clock times, with one new request every `1 / rate` seconds. It does **not** automatically retry HTTP 503 rejections. Each rate has a fixed arrival window; requests still running when the window ends are allowed to finish before statistics are printed.
+
+The output and CSV include:
+- **`target_rate_rps`** — requested send schedule in requests per second
+- **`observed_start_rps`** — number of HTTP calls actually started during the scheduling window divided by its duration
+- **`scheduled_requests` / `client_skipped`** — intended arrivals and requests the client could not launch because all of its worker slots were occupied; these are **not** server rejections
+- **`p95_start_lag_ms` / `max_start_lag_ms`** — delay between the scheduled request time and when a client thread actually started it
+- **`successful`, `rejected_503`, `rejection_rate_pct`, `errors`** — server outcomes among HTTP requests actually sent
+- **`throughput_rps`** — successful responses divided by the full benchmark wall time, including time spent draining outstanding requests; compare this alongside offered rate and actual starts
+- **`p50_latency_ms`, `p95_latency_ms`, `p99_latency_ms`** — latency percentiles of successful requests only
+
+A warning means client dispatch was delayed by more than one arrival interval at p95 or requests were skipped locally. Increase `--workers` or lower `--rates` before interpreting these results as server capacity.
+
+This is a basic **constant-rate open-loop load generator** for local learning, not a production load-testing platform. The Python client, Windows timer granularity, CPU contention (particularly when server and benchmark share the same machine), and short test duration can introduce scheduling jitter. Repeated runs and monitoring system utilization make conclusions more reliable.
+
 ### Understanding the metrics
 
 | Metric | Meaning |
@@ -200,7 +272,10 @@ The CSV contains one summary row per concurrency level and run, with a timestamp
 | Inference time | Time spent executing the model pipeline after the inference lock is acquired |
 | Lock wait | Time waiting to acquire the shared inference lock |
 | Other overhead | Mean client latency minus mean inference time minus mean lock wait (HTTP, scheduling, and remaining overhead) |
-| Errors | Requests that fail; excluded from successful-request latency percentiles |
+| Rejected (HTTP 503) | Requests deliberately rejected because inference admission capacity is full (Milestone 4 feature branch) |
+| Rejection rate | Share of all attempted requests receiving HTTP 503 (Milestone 4 feature branch) |
+| Avg rejection latency | Mean end-to-end client time for rejected requests (Milestone 4 feature branch) |
+| Errors | Other failed requests, separate from HTTP 503 overload responses in the Milestone 4 feature branch; failures are excluded from successful-request latency percentiles |
 
 **Note:** More concurrent requests do not necessarily increase throughput when inference is serialized. Percentiles measured over small samples, especially p99, should be interpreted cautiously.
 
@@ -210,7 +285,8 @@ The CSV contains one summary row per concurrency level and run, with a timestamp
 - `torch.set_num_threads(1)` is configured in `main.py` for the current tiny CPU model. This is an experimental configuration, **not a universal recommendation**.
 - Inference is serialized by a mutex; this simplifies behavior but limits concurrency.
 - Benchmarks are local and short. Results depend on CPU resources, OS, VM configuration, background load, and software versions.
-- The service does not yet implement request admission limits, production error handling, authentication, or observability.
+- The `main` branch does not yet include request admission limits; Milestone 4 implements a per-process admission cap in a feature branch.
+- The service is not yet production-hardened: it lacks comprehensive authentication, error handling, monitoring, and distributed admission control.
 - `/health` is a basic liveness check, not a comprehensive readiness check.
 
 ## Example benchmark observations
@@ -231,7 +307,8 @@ All 2,000 requests succeeded. Throughput leveled off around 33 req/s while lock-
 1. **HTTP API and validation** — complete on `main`.
 2. **CPU model inference** — complete on `main`.
 3. **Benchmarking and metrics** — complete: CLI configuration, p50/p95/p99, CSV export, and unit tests.
-4. **Performance investigations** — current experiments cover CPU threading and mutex contention; lock-wait instrumentation is on `main`.
-5. **Production-minded improvements** — planned: bounded request admission, overload/backpressure handling, better error reporting, and more testing.
+4. **Performance investigations** — CPU threading and mutex contention measured; lock-wait instrumentation is on `main`.
+5. **Overload protection / backpressure** — bounded admission, HTTP 503 handling, and fixed-rate load-generation implemented in `feature/bounded-admission-backpressure` for validation; not yet merged into `main`.
+6. **Further production-minded improvements** — future: additional error handling, observability, and realistic load tests.
 
 This project is meant to evolve incrementally, with measurements informing each subsequent design decision.
