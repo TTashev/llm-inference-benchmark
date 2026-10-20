@@ -95,11 +95,14 @@ class BatchResult:
 class MicroBatcher:
     """Single model-owner thread that drains the queue into batches."""
 
-    def __init__(self, get_generator, max_batch_size: int):
+    def __init__(self, get_generator, max_batch_size: int, max_wait_ms: float = 0.0):
         if max_batch_size < 1:
             raise ValueError("max_batch_size must be positive")
+        if max_wait_ms < 0:
+            raise ValueError("max_wait_ms cannot be negative")
         self._get_generator = get_generator
         self.max_batch_size = max_batch_size
+        self.max_wait_s = max_wait_ms / 1000
         self._queue: queue.SimpleQueue[_Pending | None] = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
         self._start_lock = threading.Lock()
@@ -134,9 +137,17 @@ class MicroBatcher:
                 return
             batch = [first]
             stop_after = False
+            # A short wait lets clients that just received a response join
+            # this batch; otherwise closed-loop clients can stay out of phase
+            # and alternate one-request batches.
+            deadline = time.perf_counter() + self.max_wait_s
             while len(batch) < self.max_batch_size:
                 try:
-                    item = self._queue.get_nowait()
+                    remaining = deadline - time.perf_counter()
+                    if remaining > 0:
+                        item = self._queue.get(timeout=remaining)
+                    else:
+                        item = self._queue.get_nowait()
                 except queue.Empty:
                     break
                 if item is None:

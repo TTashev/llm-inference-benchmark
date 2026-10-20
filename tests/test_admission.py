@@ -108,6 +108,13 @@ class AdmissionTests(unittest.TestCase):
         ):
             asyncio.run(scenario())
 
+    def test_batch_wait_must_be_non_negative(self):
+        for invalid in ("-1", "nan", "inf", "not-a-number"):
+            with self.subTest(invalid=invalid):
+                with patch.dict(os.environ, {"BATCH_WAIT_MS": invalid}):
+                    with self.assertRaises(ValueError):
+                        main.read_batch_wait_ms()
+
     def test_batch_size_must_be_positive(self):
         for invalid in ("0", "-1", "not-a-number"):
             with self.subTest(invalid=invalid):

@@ -37,7 +37,7 @@ JSON response (generated text + timing)
 
 The model is loaded **once at application startup** and reused for incoming requests. The `/generate` handler is asynchronous so it can make a **non-blocking admission decision before queueing the request for the model**.
 
-A single background thread (`MicroBatcher` in `batched_inference.py`) owns the model. Whenever it becomes free it takes **every queued request, up to `MAX_BATCH_SIZE`**, and decodes them together, one forward pass per token for the whole batch. Under low load a request runs alone with no added wait; under concurrent load requests share forward passes instead of waiting for the model one at a time. Decoding is greedy with a KV cache (`GreedyBatchGenerator`); prompts with the same token length are batched together, so no padding is needed and each response's text is identical to the `text-generation` pipeline with `do_sample=False`.
+A single background thread (`MicroBatcher` in `batched_inference.py`) owns the model. Whenever it becomes free it takes **every queued request, up to `MAX_BATCH_SIZE`**, waits up to `BATCH_WAIT_MS` (default **2 ms**) for more to arrive, and decodes them together, one forward pass per token for the whole batch. Under concurrent load requests share forward passes instead of waiting for the model one at a time. The short wait stops closed-loop clients from falling out of phase and alternating one-request batches; set `BATCH_WAIT_MS=0` to start batches immediately. Decoding is greedy with a KV cache (`GreedyBatchGenerator`); prompts with the same token length are batched together, so no padding is needed and each response's text is identical to the `text-generation` pipeline with `do_sample=False`.
 
 For each server process, `MAX_IN_FLIGHT` (default **64**) limits the number of admitted generation requests, including running and queued inference. When all permits are occupied, the server immediately responds with **HTTP 503 Service Unavailable**, `Retry-After: 1`, and a JSON error instead of accepting another inference request.
 
@@ -262,6 +262,8 @@ The CSV contains one summary row per concurrency level and run, with a timestamp
 ### Overload and backpressure experiment
 
 You can control per-process admission capacity through `MAX_IN_FLIGHT` (**default: 64**). It limits all accepted `/generate` requests (queued and running), **not** the batch size. `MAX_BATCH_SIZE` (**default: 32**) limits how many queued requests are decoded together. Set `MAX_IN_FLIGHT=4` to reproduce the earlier overload experiments with a small admission limit.
+
+Environment variables persist for the whole terminal session. If you previously ran `$env:MAX_IN_FLIGHT = "4"`, run `Remove-Item Env:MAX_IN_FLIGHT` (PowerShell) before restarting Uvicorn, and confirm the active limits with `Invoke-RestMethod http://127.0.0.1:8000/metrics` (`max_in_flight`, `max_batch_size`, `batch_wait_ms`).
 
 Windows PowerShell — set the limit **in the terminal that starts the server**:
 

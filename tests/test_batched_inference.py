@@ -99,9 +99,27 @@ class MicroBatcherTests(unittest.TestCase):
         finally:
             batcher.stop()
 
-    def test_batch_size_must_be_positive(self):
+    def test_wait_window_collects_requests_that_arrive_shortly_after(self):
+        calls = []
+
+        def generator(prompts, max_new_tokens):
+            calls.append(list(prompts))
+            return list(prompts)
+
+        batcher = MicroBatcher(lambda: generator, max_batch_size=4, max_wait_ms=500)
+        try:
+            first = batcher.submit("a", 1)
+            second = batcher.submit("b", 1)
+            self.assertEqual([first.result(3).batch_size, second.result(3).batch_size], [2, 2])
+        finally:
+            batcher.stop()
+        self.assertEqual(calls, [["a", "b"]])
+
+    def test_invalid_settings_are_rejected(self):
         with self.assertRaises(ValueError):
             MicroBatcher(lambda: None, max_batch_size=0)
+        with self.assertRaises(ValueError):
+            MicroBatcher(lambda: None, max_batch_size=1, max_wait_ms=-1)
 
 
 if __name__ == "__main__":

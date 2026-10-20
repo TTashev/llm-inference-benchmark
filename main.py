@@ -40,15 +40,28 @@ def read_max_batch_size() -> int:
     return read_positive_int_env("MAX_BATCH_SIZE", 32)
 
 
+def read_batch_wait_ms() -> float:
+    """Longest time the batcher waits for more requests before starting."""
+    raw = os.getenv("BATCH_WAIT_MS", "2")
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError("BATCH_WAIT_MS must be a non-negative number") from exc
+    if not 0 <= value < float("inf"):
+        raise ValueError("BATCH_WAIT_MS must be a non-negative number")
+    return value
+
+
 MAX_IN_FLIGHT = read_max_in_flight()
 MAX_BATCH_SIZE = read_max_batch_size()
+BATCH_WAIT_MS = read_batch_wait_ms()
 generator = None
 # Non-blocking admission at the async HTTP handler, before work reaches the
 # batch queue. Each slot covers both queued and running inference.
 inference_slots = threading.BoundedSemaphore(MAX_IN_FLIGHT)
 service_metrics = ServiceMetrics()
 # One background thread owns the model and decodes queued requests in batches.
-batcher = MicroBatcher(lambda: generator, MAX_BATCH_SIZE)
+batcher = MicroBatcher(lambda: generator, MAX_BATCH_SIZE, BATCH_WAIT_MS)
 
 torch.set_num_threads(1)
 
@@ -63,6 +76,7 @@ async def lifespan(app: FastAPI):
         pytorch_cpu_threads=torch.get_num_threads(),
         max_in_flight=MAX_IN_FLIGHT,
         max_batch_size=MAX_BATCH_SIZE,
+        batch_wait_ms=BATCH_WAIT_MS,
     )
     try:
         text_pipeline = pipeline(
@@ -125,6 +139,7 @@ async def metrics():
     return {
         "max_in_flight": MAX_IN_FLIGHT,
         "max_batch_size": MAX_BATCH_SIZE,
+        "batch_wait_ms": BATCH_WAIT_MS,
         **service_metrics.snapshot(),
     }
 
