@@ -152,7 +152,7 @@ python benchmark.py
 Windows (without activating the virtual environment):
 
 ```powershell
-.\\.venv\\Scripts\\python.exe benchmark.py
+.\.venv\Scripts\python.exe benchmark.py
 ```
 
 By default, the client warms up with five requests, then sends 50 requests at each concurrency level (1, 2, 4, and 8).
