@@ -6,6 +6,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from transformers import pipeline
 
@@ -17,6 +18,10 @@ inference_lock = threading.Lock()
 torch.set_num_threads(1)
 
 print("PyTorch CPU threads:", torch.get_num_threads())
+
+class NewlineJSONResponse(JSONResponse):
+    def render(self, content) -> bytes:
+        return super().render(content) + b"\n"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -37,8 +42,10 @@ async def lifespan(app: FastAPI):
     generator = None
 
 
-app = FastAPI(lifespan=lifespan)
-
+app = FastAPI(
+    lifespan=lifespan,
+    default_response_class=NewlineJSONResponse,
+)
 
 class GenerateRequest(BaseModel):
     prompt: str
